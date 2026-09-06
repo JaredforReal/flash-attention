@@ -678,6 +678,11 @@ def _flash_attn_fwd(
         else:
             num_splits = 1
 
+    # The SM100 head_dim=256 (2-CTA) forward kernel has no SplitKV variant
+    # (sm100_hd256_2cta_fmha_forward.py asserts), so never split there.
+    if arch // 10 == 10 and head_dim == 256 and head_dim_v == 256 and num_splits > 1:
+        num_splits = 1
+
     is_split_kv = num_splits > 1
     if is_split_kv:
         if isinstance(q, _CompileOnlyTensorSpec):
