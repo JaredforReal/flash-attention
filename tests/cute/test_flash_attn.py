@@ -2955,6 +2955,100 @@ def test_flash_attn_fp8_paged_decode_preserves_tail_mass():
     torch.testing.assert_close(out.float(), ref, atol=0.01, rtol=0.1)
 
 
+def _fp8_paged_decode_inputs(seqlen_q, seqlen_k, d, dv, nheads=16, page_size=16, seed=0):
+    torch.manual_seed(seed)
+    fp8 = torch.float8_e4m3fn
+    q = (torch.randn(seqlen_q, nheads, d, device="cuda") * 1.5).to(fp8)
+    k = (torch.randn(seqlen_k, 1, d, device="cuda") * 0.5).to(fp8)
+    v = (torch.randn(seqlen_k, 1, dv, device="cuda") * 0.5).to(fp8)
+    num_pages = math.ceil(seqlen_k / page_size)
+    k_cache = torch.zeros(num_pages, page_size, 1, d, device="cuda", dtype=fp8)
+    v_cache = torch.zeros(num_pages, page_size, 1, dv, device="cuda", dtype=fp8)
+    k_cache.view(-1, 1, d)[:seqlen_k].copy_(k)
+    v_cache.view(-1, 1, dv)[:seqlen_k].copy_(v)
+    # Scattered pages, as a real paged cache would hand out.
+    page_table = torch.randperm(num_pages, device="cuda").to(torch.int32).unsqueeze(0)
+    k_cache_perm = torch.empty_like(k_cache)
+    v_cache_perm = torch.empty_like(v_cache)
+    k_cache_perm[page_table[0].long()] = k_cache
+    v_cache_perm[page_table[0].long()] = v_cache
+    return q, k, v, k_cache_perm, v_cache_perm, page_table
+
+
+def _fp8_causal_decode_reference(q, k, v):
+    """FP32 causal attention for the last seqlen_q positions of a seqlen_k sequence."""
+    seqlen_q, nheads = q.shape[:2]
+    seqlen_k = k.shape[0]
+    scores = torch.einsum("qhd,kd->hqk", q.float(), k[:, 0].float()) * q.shape[-1] ** -0.5
+    q_pos = seqlen_k - seqlen_q + torch.arange(seqlen_q, device=q.device)
+    keep = torch.arange(seqlen_k, device=q.device)[None, :] <= q_pos[:, None]
+    scores = scores.masked_fill(~keep[None], float("-inf"))
+    return torch.einsum("hqk,kd->qhd", torch.softmax(scores, dim=-1), v[:, 0].float())
+
+
+@pytest.mark.skipif(not IS_SM100, reason="FP8 paged decode is SM100-only")
+@pytest.mark.parametrize("d,dv", [(128, 128), (192, 128)])
+@pytest.mark.parametrize("seqlen_q", [1, 9])
+@pytest.mark.parametrize("num_splits", [0, 1])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_fp8_paged_decode_splitkv(d, dv, seqlen_q, num_splits):
+    """Long-context fp8 decode with split-KV must match the reference.
+
+    Regression: the SM100 fp8 forward is wrong at tile_n=64 -- softmax statistics
+    are right but O is not, and without split-KV it faults. The diff-headdim
+    split-KV path used to force tile_n=64, so every fp8 (192, 128) decode that
+    split returned wrong attention (NaN from ~64K keys on).
+    """
+    seqlen_k = 8192 + 37
+    q, k, v, k_cache, v_cache, page_table = _fp8_paged_decode_inputs(seqlen_q, seqlen_k, d, dv)
+    descale = torch.ones(1, 1, dtype=torch.float32, device="cuda")
+    out = _flash_attn_fwd(
+        q,
+        k_cache,
+        v_cache,
+        cu_seqlens_q=torch.tensor([0, seqlen_q], dtype=torch.int32, device="cuda"),
+        seqused_k=torch.tensor([seqlen_k], dtype=torch.int32, device="cuda"),
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=seqlen_k,
+        page_table=page_table,
+        softmax_scale=d**-0.5,
+        causal=True,
+        num_splits=num_splits,
+        q_descale=descale,
+        k_descale=descale,
+        v_descale=descale,
+    )[0]
+    if is_fake_mode():
+        return
+
+    ref = _fp8_causal_decode_reference(q, k, v)
+    out = out.float()
+    assert not out.isnan().any()
+    # fp8 P costs ~2-3% of max|O|; the tile_n=64 defect is ~100%.
+    rel_err = ((out - ref).abs().max() / ref.abs().max()).item()
+    assert rel_err < 0.06, f"{rel_err=}"
+
+
+@pytest.mark.skipif(not IS_SM100, reason="FP8 forward is SM100-only")
+def test_flash_attn_fp8_rejects_tile_n_64():
+    q, _, _, k_cache, v_cache, page_table = _fp8_paged_decode_inputs(1, 1024, 128, 128)
+    descale = torch.ones(1, 1, dtype=torch.float32, device="cuda")
+    with pytest.raises(NotImplementedError, match="n_block_size >= 128"):
+        _flash_attn_fwd(
+            q,
+            k_cache,
+            v_cache,
+            cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+            seqused_k=torch.tensor([1024], dtype=torch.int32, device="cuda"),
+            page_table=page_table,
+            causal=True,
+            tile_mn=(128, 64),
+            q_descale=descale,
+            k_descale=descale,
+            v_descale=descale,
+        )
+
+
 def _decode_fwd_config(**overrides):
     major, minor = torch.cuda.get_device_capability()
     kw = dict(
@@ -2977,6 +3071,16 @@ def test_fwd_config_split_kv_decode_prefers_single_q_stage():
                              pack_gqa=False, batch_size=8, num_head_kv=16)
     # (the heuristic returns 0 once m-blocks alone fill the GPU; both mean unsplit)
     assert cfg.num_splits <= 1 and cfg.q_stage == 2
+
+
+@pytest.mark.skipif(not IS_SM100, reason="SM100 tile heuristics")
+def test_fwd_config_diff_headdim_split_kv_tile_n():
+    # 16-bit K/V: the fp32 partial O forces tile_n=64 to fit shared memory.
+    cfg = _decode_fwd_config(head_dim=192)
+    assert cfg.num_splits > 1 and cfg.n_block_size == 64
+    # 8-bit K/V fit at tile_n=128, and the fp8 forward is wrong below it.
+    cfg = _decode_fwd_config(head_dim=192, kv_8bit=True)
+    assert cfg.num_splits > 1 and cfg.n_block_size == 128
 
 
 @pytest.mark.parametrize("page_size", [16, 64, 256])

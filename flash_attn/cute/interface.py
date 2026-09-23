@@ -379,6 +379,7 @@ def _get_fwd_config(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     mma_pv_is_rs: Optional[bool] = None,
     intra_wg_overlap: Optional[bool] = None,
+    kv_8bit: bool = False,
 ) -> FwdConfig:
     if seqlen_q is None:
         seqlen_q = max_seqlen_q
@@ -446,8 +447,10 @@ def _get_fwd_config(
         num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
 
     # SplitKV uses float32 partial output, which doubles the O buffer size
-    # in shared memory, causing OOM for diff-headdim (192, 128)
-    if arch // 10 in [10, 11] and head_dim != head_dim_v and num_splits > 1:
+    # in shared memory, causing OOM for diff-headdim (192, 128). 8-bit K/V take
+    # half the shared memory, so they fit at tile_n=128 and must stay there: the
+    # SM100 fp8 forward is incorrect at tile_n=64 (see _flash_attn_fwd).
+    if arch // 10 in [10, 11] and head_dim != head_dim_v and num_splits > 1 and not kv_8bit:
         if num_n_blocks >= 64 and head_dim_v != 512:
             tile_n = 64
             num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
@@ -974,8 +977,17 @@ def _flash_attn_fwd(
         block_sparse_tensors=block_sparse_tensors,
         mma_pv_is_rs=mma_pv_is_rs,
         intra_wg_overlap=intra_wg_overlap,
+        kv_8bit=is_fp8,
     )
     tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
+    if is_fp8 and arch // 10 in [10, 11] and tile_n < 128:
+        # Measured on SM100 for hdim 64, 128 and 192/128: at tile_n=64 the fp8
+        # forward returns wrong O (softmax statistics are correct) with split-KV
+        # and faults with an illegal address without it. Refuse rather than
+        # return silently wrong attention.
+        raise NotImplementedError(
+            f"FP8 forward on SM100 requires n_block_size >= 128, got {tile_n}"
+        )
     q_stage = fwd_cfg.q_stage
     num_splits = fwd_cfg.num_splits
     mma_pv_is_rs = fwd_cfg.mma_pv_is_rs
@@ -4482,6 +4494,7 @@ def get_scheduler_metadata(
     seqused_k: Optional[torch.Tensor] = None,
     leftpad_k: Optional[torch.Tensor] = None,
     seqlen_k_per_split: Optional[int] = None,
+    kv_dtype: Optional[torch.dtype] = None,
     _arch: Optional[int] = None,
 ) -> SchedulerMetadataTensorsTorch:
     """Prepares metadata tensors used by varlen tile schedulers (SingleTileVarlenScheduler
@@ -4491,6 +4504,8 @@ def get_scheduler_metadata(
         num_splits: maximum number of splits per batch entry that the prepare kernel can emit
         seqlen_k_per_split: for bitwise reproducibility between forward and backward, can fix
             an exact seqlen_k per split; num_splits is calculated accordingly.
+        kv_dtype: dtype of the K/V the forward will read. Pass it for an fp8 KV cache so the
+            tile size (and hence the split layout) matches what the forward chooses.
 
     Returns
         SchedulerMetadataTensorsTorch, a named tuple including:
@@ -4550,6 +4565,7 @@ def get_scheduler_metadata(
         num_head_kv=nheads_kv,
         num_splits=num_splits,
         device=device,
+        kv_8bit=kv_dtype in (torch.float8_e4m3fn, torch.float8_e5m2),
     )
     tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
     q_stage = fwd_cfg.q_stage
