@@ -433,6 +433,7 @@ def _get_fwd_config(
     total_mblocks = batch_size * num_head_kv * num_m_blocks
     num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
     num_SMs = None
+    requested_num_splits = num_splits
     # hd=256 forward uses the dedicated Blackwell-family kernel, which has no
     # SplitKV variant.
     use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
@@ -455,6 +456,30 @@ def _get_fwd_config(
             num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
         else:
             num_splits = 1
+
+    # Split-KV means there are too few m-blocks to fill the GPU, so each CTA
+    # streams a long stretch of KV and its per-tile latency sets the pace. With
+    # q_stage=2 each Q stage owns a single S buffer in TMEM, so a stage cannot
+    # issue QK for the next KV tile while softmax runs on the current one; with
+    # q_stage=1 the two S buffers ping-pong across consecutive KV tiles. Running
+    # the two Q halves as separate m-blocks re-reads KV, but is 4-43% faster on
+    # SM100 for every split-KV decode shape measured (hdim 64, 128 and 192/128;
+    # 136-1024 packed query rows; 8K-176K keys; batch 1-8).
+    if arch // 10 in [10, 11] and q_stage == 2 and num_splits > 1:
+        num_m_blocks_q1 = (seqlen_q_packgqa + tile_m - 1) // tile_m
+        total_mblocks_q1 = batch_size * num_head_kv * num_m_blocks_q1
+        num_splits_q1 = num_splits
+        if requested_num_splits < 1:
+            if num_SMs is None:
+                num_SMs = get_num_sms_for_selection(device.index, arch)
+            num_splits_q1 = num_splits_heuristic(total_mblocks_q1, num_SMs, num_n_blocks, 128)
+        # Only when the extra m-blocks still leave room to split: the unsplit
+        # q_stage=1 case has not been measured against q_stage=2. This runs
+        # after the diff-headdim adjustment above so it sees the final split
+        # count and tile_n.
+        if num_splits_q1 > 1:
+            q_stage = 1
+            num_splits = num_splits_q1
 
     return FwdConfig(tile_m, tile_n, mma_pv_is_rs, intra_wg_overlap, q_stage, num_splits)
 

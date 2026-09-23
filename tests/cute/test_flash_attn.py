@@ -2955,6 +2955,30 @@ def test_flash_attn_fp8_paged_decode_preserves_tail_mass():
     torch.testing.assert_close(out.float(), ref, atol=0.01, rtol=0.1)
 
 
+def _decode_fwd_config(**overrides):
+    major, minor = torch.cuda.get_device_capability()
+    kw = dict(
+        arch=major * 10 + minor, head_dim=128, head_dim_v=128, max_seqlen_q=9, max_seqlen_k=131072,
+        num_head_kv=1, qhead_per_kvhead=16, pack_gqa=True, batch_size=1, causal=True,
+        local=False, window_size_left=None, window_size_right=None, num_splits=0,
+        device=torch.device("cuda"),
+    )
+    kw.update(overrides)
+    return flash_attn_interface._get_fwd_config(**kw)
+
+
+@pytest.mark.skipif(not IS_SM100, reason="SM100 tile heuristics")
+def test_fwd_config_split_kv_decode_prefers_single_q_stage():
+    # 16 q heads x 9 tokens = 144 packed rows: over one 128-row tile.
+    cfg = _decode_fwd_config()
+    assert cfg.num_splits > 1 and cfg.q_stage == 1
+    # Prefill fills the GPU without splitting and keeps both Q stages.
+    cfg = _decode_fwd_config(max_seqlen_q=4096, max_seqlen_k=4096, qhead_per_kvhead=1,
+                             pack_gqa=False, batch_size=8, num_head_kv=16)
+    # (the heuristic returns 0 once m-blocks alone fill the GPU; both mean unsplit)
+    assert cfg.num_splits <= 1 and cfg.q_stage == 2
+
+
 @pytest.mark.parametrize("page_size", [16, 64, 256])
 @pytest.mark.parametrize("seqlen_q", [64, 128, 256])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
