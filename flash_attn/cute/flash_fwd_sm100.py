@@ -1165,8 +1165,11 @@ class FlashAttentionForwardSm100:
         )
 
         block_info = BlockInfo(
-            # This is cta_tiler, not mma_tiler_qk, since we move by block by (2 * mma_tiler[0], mma_tiler[1])
-            self.cta_tiler[0],
+            # This is cta_tiler, not mma_tiler_qk, since we move by block by (2 * mma_tiler[0], mma_tiler[1]).
+            # With 2CTA, m_block indexes the cluster, so the rows it covers span both CTAs: the
+            # causal / local n_block range must use cta_group_size * cta_tiler[0], or the peer
+            # CTA's rows lose the KV blocks only they can see.
+            self.cta_tiler[0] * self.cta_group_size,
             self.cta_tiler[1],
             self.is_causal,
             self.is_local,
