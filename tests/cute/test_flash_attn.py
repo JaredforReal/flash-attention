@@ -3049,6 +3049,85 @@ def test_flash_attn_fp8_rejects_tile_n_64():
         )
 
 
+
+def _paged_decode_inputs(batch, seqlen_q, seqlen_k, d, dv, nheads=16, page_size=128, seed=0):
+    torch.manual_seed(seed)
+    dtype = torch.bfloat16
+    q = torch.randn(batch * seqlen_q, nheads, d, device="cuda", dtype=dtype)
+    k = torch.randn(batch, seqlen_k, 1, d, device="cuda", dtype=dtype)
+    v = torch.randn(batch, seqlen_k, 1, dv, device="cuda", dtype=dtype)
+    # A large last value makes dropping the last key (or its KV block) a large error.
+    v[:, -1] *= 20
+    pages_per_seq = math.ceil(seqlen_k / page_size)
+    num_pages = batch * pages_per_seq
+    k_cache = torch.zeros(num_pages, page_size, 1, d, device="cuda", dtype=dtype)
+    v_cache = torch.zeros(num_pages, page_size, 1, dv, device="cuda", dtype=dtype)
+    # Scattered pages, as a real paged cache would hand out.
+    page_table = torch.randperm(num_pages, device="cuda").to(torch.int32).view(batch, pages_per_seq)
+    for b in range(batch):
+        kb = torch.zeros(pages_per_seq * page_size, 1, d, device="cuda", dtype=dtype)
+        vb = torch.zeros(pages_per_seq * page_size, 1, dv, device="cuda", dtype=dtype)
+        kb[:seqlen_k], vb[:seqlen_k] = k[b], v[b]
+        k_cache[page_table[b].long()] = kb.view(pages_per_seq, page_size, 1, d)
+        v_cache[page_table[b].long()] = vb.view(pages_per_seq, page_size, 1, dv)
+    return q, k, v, k_cache, v_cache, page_table
+
+
+def _decode_reference(q, k, v, causal):
+    """FP32 attention for the last seqlen_q positions of a seqlen_k sequence."""
+    seqlen_q, seqlen_k = q.shape[0], k.shape[0]
+    scores = torch.einsum("qhd,kd->hqk", q.float(), k[:, 0].float()) * q.shape[-1] ** -0.5
+    if causal:
+        q_pos = seqlen_k - seqlen_q + torch.arange(seqlen_q, device=q.device)
+        keep = torch.arange(seqlen_k, device=q.device)[None, :] <= q_pos[:, None]
+        scores = scores.masked_fill(~keep[None], float("-inf"))
+    return torch.einsum("hqk,kd->qhd", torch.softmax(scores, dim=-1), v[:, 0].float())
+
+
+@pytest.mark.skipif(not IS_SM100, reason="2-CTA forward is SM100-only")
+@pytest.mark.parametrize("d,dv", [(128, 128), (192, 128)])
+# 16 q heads per KV head: 9 and 16 tokens pack into 144 and 256 rows, one 2-CTA cluster tile
+@pytest.mark.parametrize("seqlen_q", [9, 16])
+# 129 and 257 put a single key in the last KV block; only the peer CTA's rows reach it
+@pytest.mark.parametrize("seqlen_k", [129, 257, 8192 + 37])
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("num_splits", [0, 1])
+# A CUDA-graph caller passes a fixed, large max_seqlen_k; with auto splits that
+# takes the split-KV / varlen-scheduler path even for a short sequence.
+@pytest.mark.parametrize("graph_max_seqlen_k", [False, True])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_2cta_paged_decode(
+    d, dv, seqlen_q, seqlen_k, causal, num_splits, graph_max_seqlen_k
+):
+    """Decode-sized queries that fit one 2-CTA cluster tile run on the 2-CTA path
+    (split-KV, varlen q, causal, paged KV at page_size 128) and must match the
+    reference. Regression: the causal n_block range was computed for one CTA's
+    rows, so the peer CTA lost the last KV block whenever only it could see it."""
+    batch = 2
+    q, k, v, k_cache, v_cache, page_table = _paged_decode_inputs(batch, seqlen_q, seqlen_k, d, dv)
+    out = _flash_attn_fwd(
+        q,
+        k_cache,
+        v_cache,
+        cu_seqlens_q=torch.arange(0, batch * seqlen_q + 1, seqlen_q, dtype=torch.int32, device="cuda"),
+        seqused_k=torch.full((batch,), seqlen_k, dtype=torch.int32, device="cuda"),
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=262144 if graph_max_seqlen_k else seqlen_k,
+        page_table=page_table,
+        softmax_scale=d**-0.5,
+        causal=causal,
+        num_splits=num_splits,
+    )[0]
+    if is_fake_mode():
+        return
+    for b in range(batch):
+        ref = _decode_reference(q[b * seqlen_q : (b + 1) * seqlen_q], k[b], v[b], causal)
+        o = out[b * seqlen_q : (b + 1) * seqlen_q].float()
+        # per (token, head) row, so one token's rows cannot hide in the others
+        rel_err = ((o - ref).norm(dim=-1) / ref.norm(dim=-1)).max().item()
+        assert rel_err < 2e-2, f"{b=} {rel_err=}"
+
+
 def _decode_fwd_config(**overrides):
     major, minor = torch.cuda.get_device_capability()
     kw = dict(

@@ -380,6 +380,7 @@ def _get_fwd_config(
     mma_pv_is_rs: Optional[bool] = None,
     intra_wg_overlap: Optional[bool] = None,
     kv_8bit: bool = False,
+    decode_2cta_eligible: bool = False,
 ) -> FwdConfig:
     if seqlen_q is None:
         seqlen_q = max_seqlen_q
@@ -450,7 +451,19 @@ def _get_fwd_config(
     # in shared memory, causing OOM for diff-headdim (192, 128). 8-bit K/V take
     # half the shared memory, so they fit at tile_n=128 and must stay there: the
     # SM100 fp8 forward is incorrect at tile_n=64 (see _flash_attn_fwd).
-    if arch // 10 in [10, 11] and head_dim != head_dim_v and num_splits > 1 and not kv_8bit:
+    # A decode-sized query that fits one 2-CTA cluster tile runs on the 2-CTA path
+    # (see _flash_attn_fwd). Each CTA of the pair holds only half of every K/V tile,
+    # so the tile_n=64 fallback is not needed there. It would also move a
+    # page_size=128 cache off paged TMA onto the cp.async loader, which does not
+    # split the tile between the two CTAs.
+    decode_2cta = decode_2cta_eligible and tile_m < seqlen_q_packgqa <= 2 * tile_m
+    if (
+        arch // 10 in [10, 11]
+        and head_dim != head_dim_v
+        and num_splits > 1
+        and not kv_8bit
+        and not decode_2cta
+    ):
         if num_n_blocks >= 64 and head_dim_v != 512:
             tile_n = 64
             num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
@@ -956,6 +969,18 @@ def _flash_attn_fwd(
     if cu_seqlens_k is None and seqused_k is None:
         min_seqlen_k = seqlen_k
 
+    # Static conditions for the 2-CTA path that _get_fwd_config cannot see; the
+    # query-size condition is applied once the tile size is known.
+    decode_2cta_eligible = (
+        arch // 10 in [10, 11]
+        and not requested_disable_2cta
+        and not local
+        and seqused_q is None
+        and not use_block_sparsity
+        and page_size in [None, 128]
+        and int(math.ceil(head_dim / 16) * 16) in [128, 192]
+        and int(math.ceil(head_dim_v / 16) * 16) == 128
+    )
     fwd_cfg = _get_fwd_config(
         arch=arch,
         head_dim=head_dim,
@@ -978,6 +1003,7 @@ def _flash_attn_fwd(
         mma_pv_is_rs=mma_pv_is_rs,
         intra_wg_overlap=intra_wg_overlap,
         kv_8bit=is_fp8,
+        decode_2cta_eligible=decode_2cta_eligible,
     )
     tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
     if is_fp8 and arch // 10 in [10, 11] and tile_n < 128:
@@ -1029,19 +1055,25 @@ def _flash_attn_fwd(
             out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
             lse_partial = torch.empty(num_splits, *lse_shape, dtype=torch.float32, device=device)
 
+    # Decode-sized queries whose packed rows fit one 2-CTA cluster tile,
+    # (tile_m, 2 * tile_m], run on the 2-CTA path even when causal, split-KV or
+    # varlen: the CTA pair shares every K/V tile, so the KV is read once instead
+    # of once per m-block. Without it such a query needs two m-blocks that each
+    # stream the whole KV (e.g. 16 q heads per KV head x 9 tokens = 144 rows).
+    decode_2cta = decode_2cta_eligible and tile_m < seqlen_q_packgqa <= 2 * tile_m
     use_2cta_instrs = (
         arch // 10 in [10, 11]
         and not requested_disable_2cta
-        and not causal
+        and (decode_2cta or not causal)
         and not local
-        and not is_split_kv
-        and cu_seqlens_q is None
+        and (decode_2cta or not is_split_kv)
+        and (decode_2cta or cu_seqlens_q is None)
         and seqused_q is None
         and not use_block_sparsity
         and page_size in [None, 128]
         and int(math.ceil(head_dim / 16) * 16) in [128, 192]
         and int(math.ceil(head_dim_v / 16) * 16) == 128
-        and seqlen_q_packgqa > 2 * tile_m
+        and (decode_2cta or seqlen_q_packgqa > 2 * tile_m)
         and (tile_m % qhead_per_kvhead == 0 or not pack_gqa)
     )
 
@@ -1208,9 +1240,11 @@ def _flash_attn_fwd(
 
     is_varlen_q = cu_seqlens_q is not None or seqused_q is not None
     cluster_shape_m = 2 if use_2cta_instrs else 1
-    if use_dedicated_hd256_kernel:
-        # The hd=256 2CTA fwd kernel does not support the dynamic-persistent scheduler.
+    if use_dedicated_hd256_kernel or (decode_2cta and use_2cta_instrs):
+        # Neither the hd=256 2CTA fwd kernel nor the generic 2CTA decode path
+        # supports the dynamic-persistent scheduler (it requires a 1x1 cluster).
         scheduler_metadata = None
+        disable_scheduler_metadata = True
     elif (
         is_split_kv
         and scheduler_metadata is not None
